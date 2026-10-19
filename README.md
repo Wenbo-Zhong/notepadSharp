@@ -31,7 +31,7 @@ cmake --build build --config Release
 Ubuntu：
 
 ```bash
-sudo apt install build-essential cmake pkg-config libgtk-3-dev
+sudo apt install build-essential cmake pkg-config libgtk-3-dev libfontconfig1-dev libwxgtk3.2-dev
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build
 ```
