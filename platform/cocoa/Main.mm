@@ -1,10 +1,12 @@
 #import <Cocoa/Cocoa.h>
+#import <CoreText/CoreText.h>
 
 #include "App.h"
 #include "Scintilla.h"
 #include "ScintillaView.h"
 
 #include <algorithm>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -27,7 +29,7 @@ struct Slot {
 
 class MacHost;
 
-@interface AppDelegate : NSObject <NSApplicationDelegate, NSTabViewDelegate>
+@interface AppDelegate : NSObject <NSApplicationDelegate, NSTabViewDelegate, NSMenuDelegate>
 @property(nonatomic, assign) MacHost *host;
 - (NSInteger)lastDialogTag;
 - (void)endDialog:(id)sender;
@@ -129,6 +131,11 @@ public:
         return fromNS(panel.URL.path);
     }
 
+    std::string promptDirectory() override {
+        NSOpenPanel *panel = [NSOpenPanel openPanel]; panel.canChooseFiles = NO; panel.canChooseDirectories = YES;
+        panel.allowsMultipleSelection = NO; panel.title = @"选择搜索文件夹";
+        return [panel runModal] == NSModalResponseOK ? fromNS(panel.URL.path) : std::string();
+    }
     std::string promptOpenPath() override { return choosePath(false, ""); }
     std::string promptSavePath(const std::string &suggested) override { return choosePath(true, suggested); }
 
@@ -153,30 +160,38 @@ public:
     FindRequest promptFind(const FindRequest &seed, bool replaceMode) override {
         FindRequest request = seed;
         request.cancelled = true;
-        NSPanel *panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 380, replaceMode ? 168 : 132)
+        NSPanel *panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 380, replaceMode ? 230 : 194)
                                                       styleMask:NSWindowStyleMaskTitled
                                                         backing:NSBackingStoreBuffered
                                                           defer:NO];
         panel.title = replaceMode ? @"替换" : @"查找";
         NSTextField *findLabel = [NSTextField labelWithString:@"查找"];
-        findLabel.frame = NSMakeRect(12, replaceMode ? 128 : 92, 50, 22);
-        NSTextField *find = [[NSTextField alloc] initWithFrame:NSMakeRect(70, replaceMode ? 128 : 92, 290, 24)];
+        findLabel.frame = NSMakeRect(12, replaceMode ? 190 : 154, 50, 22);
+        NSTextField *find = [[NSTextField alloc] initWithFrame:NSMakeRect(70, replaceMode ? 190 : 154, 290, 24)];
         find.stringValue = toNS(seed.find);
         NSTextField *repl = nil;
         if (replaceMode) {
             NSTextField *replLabel = [NSTextField labelWithString:@"替换"];
-            replLabel.frame = NSMakeRect(12, 96, 50, 22);
-            repl = [[NSTextField alloc] initWithFrame:NSMakeRect(70, 96, 290, 24)];
+            replLabel.frame = NSMakeRect(12, 158, 50, 22);
+            repl = [[NSTextField alloc] initWithFrame:NSMakeRect(70, 158, 290, 24)];
             repl.stringValue = toNS(seed.replace);
             [panel.contentView addSubview:replLabel];
             [panel.contentView addSubview:repl];
         }
         NSButton *matchCase = [NSButton checkboxWithTitle:@"区分大小写" target:nil action:nil];
-        matchCase.frame = NSMakeRect(12, replaceMode ? 64 : 56, 140, 22);
+        matchCase.frame = NSMakeRect(12, replaceMode ? 126 : 118, 140, 22);
         matchCase.state = seed.matchCase ? NSControlStateValueOn : NSControlStateValueOff;
         NSButton *wholeWord = [NSButton checkboxWithTitle:@"全字匹配" target:nil action:nil];
-        wholeWord.frame = NSMakeRect(170, replaceMode ? 64 : 56, 140, 22);
+        wholeWord.frame = NSMakeRect(170, replaceMode ? 126 : 118, 140, 22);
         wholeWord.state = seed.wholeWord ? NSControlStateValueOn : NSControlStateValueOff;
+        NSButton *regex = [NSButton checkboxWithTitle:@"正则表达式（替换引用：\\1）" target:nil action:nil];
+        regex.frame = NSMakeRect(12, 88, 340, 22);
+        regex.state = seed.regex ? NSControlStateValueOn : NSControlStateValueOff;
+        [panel.contentView addSubview:regex];
+        NSButton *unicode = [NSButton checkboxWithTitle:@"完整 Unicode（ICU，需启用正则）" target:nil action:nil];
+        unicode.frame = NSMakeRect(12, 52, 350, 22);
+        unicode.state = seed.unicode ? NSControlStateValueOn : NSControlStateValueOff;
+        [panel.contentView addSubview:unicode];
         auto button = [&](NSString *title, int tag, CGFloat x) {
             NSButton *control = [NSButton buttonWithTitle:title target:delegate action:@selector(endDialog:)];
             control.tag = tag;
@@ -203,6 +218,8 @@ public:
             request.replace = repl ? fromNS(repl.stringValue) : "";
             request.matchCase = matchCase.state == NSControlStateValueOn;
             request.wholeWord = wholeWord.state == NSControlStateValueOn;
+            request.regex = regex.state == NSControlStateValueOn;
+            request.unicode = unicode.state == NSControlStateValueOn;
             request.action = tag == 3 ? FindAction::ReplaceAll : tag == 2 ? FindAction::ReplaceOne : FindAction::Next;
             request.cancelled = request.find.empty();
         }
@@ -210,12 +227,13 @@ public:
         return request;
     }
 
-    int promptGoto(int currentLine, int lineCount) override {
+    int promptGoto(int currentLine, int lineCount) override { return promptNumber("转到行", currentLine, lineCount); }
+    int promptNumber(const std::string &title, int currentLine, int lineCount) override {
         NSPanel *panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 260, 110)
                                                       styleMask:NSWindowStyleMaskTitled
                                                         backing:NSBackingStoreBuffered
                                                           defer:NO];
-        panel.title = toNS("转到行 (1-" + std::to_string(lineCount) + ")");
+        panel.title = toNS(title + " (1-" + std::to_string(lineCount) + ")");
         NSTextField *entry = [[NSTextField alloc] initWithFrame:NSMakeRect(12, 58, 230, 24)];
         entry.stringValue = toNS(std::to_string(currentLine));
         NSButton *ok = [NSButton buttonWithTitle:@"确定" target:delegate action:@selector(endDialog:)];
@@ -234,7 +252,19 @@ public:
         return line;
     }
 
-    std::string monoFont() const override { return "Menlo"; }
+    void setFullScreen(bool enabled) override { if (((window.styleMask & NSWindowStyleMaskFullScreen) != 0) != enabled) [window toggleFullScreen:nil]; }
+    void setAlwaysOnTop(bool enabled) override { window.level = enabled ? NSFloatingWindowLevel : NSNormalWindowLevel; }
+    std::string stateDirectory() const override {
+        NSString *base = NSSearchPathForDirectoriesInDomains(NSApplicationSupportDirectory, NSUserDomainMask, YES).firstObject;
+        return fromNS([base stringByAppendingPathComponent:@"NotepadSharp"]);
+    }
+    bool askReloadExternal(const std::string &message) override {
+        NSAlert *alert = [[NSAlert alloc] init]; alert.messageText = toNS(message);
+        [alert addButtonWithTitle:@"保留当前内容"]; [alert addButtonWithTitle:@"确认"];
+        return [alert runModal] == NSAlertSecondButtonReturn;
+    }
+    bool askOverwriteExternal(const std::string &message) override { return askReloadExternal(message); }
+    std::string monoFont() const override { return "JetBrains Mono"; }
     int defaultEol() const override { return SC_EOL_LF; }
 
     void quit() override {
@@ -303,7 +333,10 @@ public:
     [file addItem:[self item:@"保存" command:CmdSave key:@"s" mods:NSEventModifierFlagCommand]];
     [file addItem:[self item:@"另存为..." command:CmdSaveAs key:@"S" mods:NSEventModifierFlagCommand | NSEventModifierFlagShift]];
     [file addItem:[self item:@"关闭" command:CmdClose key:@"w" mods:NSEventModifierFlagCommand]];
+    NSMenuItem *recentItem = [[NSMenuItem alloc] initWithTitle:@"最近文件" action:nil keyEquivalent:@""];
+    NSMenu *recent = [[NSMenu alloc] initWithTitle:@"最近文件"]; recent.delegate = self; recentItem.submenu = recent; [file addItem:recentItem];
     top(@"文件", file);
+    NSMenu *documents = [[NSMenu alloc] initWithTitle:@"窗口"]; documents.delegate = self; top(@"窗口", documents);
     NSMenu *edit = [[NSMenu alloc] initWithTitle:@"编辑"];
     [edit addItem:[self item:@"撤销" command:CmdUndo key:@"z" mods:NSEventModifierFlagCommand]];
     [edit addItem:[self item:@"重做" command:CmdRedo key:@"y" mods:NSEventModifierFlagCommand]];
@@ -329,15 +362,44 @@ public:
     [view addItem:[self item:@"缩小" command:CmdZoomOut key:@"-" mods:NSEventModifierFlagCommand]];
     [view addItem:[self item:@"重置缩放" command:CmdZoomReset key:@"0" mods:NSEventModifierFlagCommand]];
     top(@"视图", view);
+    NSMenu *tools = [[NSMenu alloc] initWithTitle:@"代码工具"];
+    for (const char *group : {"会话与文件", "编码", "搜索结果", "文本处理", "书签与折叠", "宏", "代码补全", "视图"}) {
+        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:toNS(group) action:nil keyEquivalent:@""];
+        NSMenu *submenu = [[NSMenu alloc] initWithTitle:toNS(group)]; item.submenu = submenu; [tools addItem:item];
+        for (const auto &entry : extraCommands) if (std::strcmp(extraCommandGroup(entry.command), group) == 0) {
+            NSString *key = entry.command == CmdCompleteWord ? @" " : @"";
+            NSEventModifierFlags mods = entry.command == CmdCompleteWord ? NSEventModifierFlagControl : 0;
+            [submenu addItem:[self item:toNS(entry.label) command:entry.command key:key mods:mods]];
+        }
+    }
+    top(@"代码工具", tools);
+    NSMenu *languages = [[NSMenu alloc] initWithTitle:@"语言"];
+    for (int i=0; i<languageChoiceCount; ++i) [languages addItem:[self item:toNS(languageChoices[i].label) command:static_cast<Command>(CmdLanguageBase+i) key:@"" mods:0]];
+    top(@"语言", languages);
+    NSMenu *font = [[NSMenu alloc] initWithTitle:@"字体"];
+    for (int size = 6; size <= 72; ++size) [font addItem:[self item:toNS(std::to_string(size) + " pt") command:static_cast<Command>(CmdFontSizeBase + size) key:@"" mods:0]];
+    for (int i = 0; i < 8; ++i) [font addItem:[self item:toNS("Weight " + std::to_string(100 * (i+1))) command:static_cast<Command>(CmdFontWeightBase + i) key:@"" mods:0]];
+    [font addItem:[self item:@"切换斜体" command:CmdFontItalic key:@"" mods:0]];
+    top(@"字体", font);
     NSApp.mainMenu = menubar;
 
     _app = new App(*_hostObject);
     _hostObject->app = _app;
     _app->start();
+    [NSTimer scheduledTimerWithTimeInterval:2 repeats:YES block:^(NSTimer *) { if (self->_app) self->_app->pollFiles(); }];
+    [NSTimer scheduledTimerWithTimeInterval:30 repeats:YES block:^(NSTimer *) { if (self->_app) self->_app->checkpoint(); }];
     NSArray<NSString *> *args = NSProcessInfo.processInfo.arguments;
     if (args.count > 1) _app->openPath(fromNS(args[1]));
     [_hostObject->window center];
     [_hostObject->window makeKeyAndOrderFront:nil];
+}
+
+- (void)menuNeedsUpdate:(NSMenu *)menu {
+    if (!_app) return;
+    const bool recent = [menu.title isEqualToString:@"最近文件"];
+    const auto names = recent ? _app->recentFiles() : _app->documentNames();
+    [menu removeAllItems];
+    for (size_t i=0; i<names.size() && i<1000; ++i) [menu addItem:[self item:toNS(names[i]) command:static_cast<Command>((recent ? CmdRecentBase : CmdDocumentBase)+i) key:@"" mods:0]];
 }
 
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
@@ -361,6 +423,11 @@ int main(int argc, const char **argv) {
     (void)argc;
     (void)argv;
     @autoreleasepool {
+        NSString *directory = [[NSProcessInfo.processInfo.arguments[0] stringByStandardizingPath] stringByDeletingLastPathComponent];
+        NSURL *fonts = [NSURL fileURLWithPath:[directory stringByAppendingPathComponent:@"fonts"]];
+        for (NSURL *url in [[NSFileManager defaultManager] contentsOfDirectoryAtURL:fonts includingPropertiesForKeys:nil options:0 error:nil]) {
+            if ([url.pathExtension isEqualToString:@"ttf"]) CTFontManagerRegisterFontsForURL((__bridge CFURLRef)url, kCTFontManagerScopeProcess, nullptr);
+        }
         NSApplication *application = [NSApplication sharedApplication];
         [application setActivationPolicy:NSApplicationActivationPolicyRegular];
         AppDelegate *delegate = [[AppDelegate alloc] init];

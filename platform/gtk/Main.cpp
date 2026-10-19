@@ -1,4 +1,6 @@
 #include <gtk/gtk.h>
+#include <fontconfig/fontconfig.h>
+#include <filesystem>
 
 #include "App.h"
 #include "Scintilla.h"
@@ -6,6 +8,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -100,6 +103,15 @@ public:
         }
     }
 
+    std::string promptDirectory() override {
+        GtkWidget *dialog = gtk_file_chooser_dialog_new("选择搜索文件夹", GTK_WINDOW(window), GTK_FILE_CHOOSER_ACTION_SELECT_FOLDER,
+            "取消", GTK_RESPONSE_CANCEL, "选择", GTK_RESPONSE_ACCEPT, nullptr);
+        std::string path;
+        if (gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_ACCEPT) {
+            char *chosen = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(dialog)); path = fromUtf8(chosen); g_free(chosen);
+        }
+        gtk_widget_destroy(dialog); return path;
+    }
     std::string promptOpenPath() override {
         GtkWidget *dialog = gtk_file_chooser_dialog_new("打开", GTK_WINDOW(window), GTK_FILE_CHOOSER_ACTION_OPEN,
                                                          "取消", GTK_RESPONSE_CANCEL, "打开", GTK_RESPONSE_ACCEPT, nullptr);
@@ -179,6 +191,12 @@ public:
         gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(wholeWord), seed.wholeWord);
         gtk_grid_attach(GTK_GRID(grid), matchCase, 0, 2, 2, 1);
         gtk_grid_attach(GTK_GRID(grid), wholeWord, 0, 3, 2, 1);
+        GtkWidget *regex = gtk_check_button_new_with_label("正则表达式（替换引用：\\1）");
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(regex), seed.regex);
+        gtk_grid_attach(GTK_GRID(grid), regex, 0, 4, 2, 1);
+        GtkWidget *unicode = gtk_check_button_new_with_label("完整 Unicode（ICU，需启用正则）");
+        gtk_toggle_button_set_active(GTK_TOGGLE_BUTTON(unicode), seed.unicode);
+        gtk_grid_attach(GTK_GRID(grid), unicode, 0, 5, 2, 1);
         gtk_container_add(GTK_CONTAINER(box), grid);
         gtk_widget_show_all(dialog);
         const int response = gtk_dialog_run(GTK_DIALOG(dialog));
@@ -187,6 +205,8 @@ public:
             request.replace = replaceMode ? gtk_entry_get_text(GTK_ENTRY(repl)) : "";
             request.matchCase = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(matchCase));
             request.wholeWord = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(wholeWord));
+            request.regex = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(regex));
+            request.unicode = gtk_toggle_button_get_active(GTK_TOGGLE_BUTTON(unicode));
             request.action = response == 2 ? FindAction::ReplaceAll : response == 1 ? FindAction::ReplaceOne : FindAction::Next;
             request.cancelled = request.find.empty();
         }
@@ -194,12 +214,13 @@ public:
         return request;
     }
 
-    int promptGoto(int currentLine, int lineCount) override {
-        GtkWidget *dialog = gtk_dialog_new_with_buttons("转到行", GTK_WINDOW(window),
+    int promptGoto(int currentLine, int lineCount) override { return promptNumber("转到行", currentLine, lineCount); }
+    int promptNumber(const std::string &title, int currentLine, int lineCount) override {
+        GtkWidget *dialog = gtk_dialog_new_with_buttons(title.c_str(), GTK_WINDOW(window),
                                                          static_cast<GtkDialogFlags>(GTK_DIALOG_MODAL | GTK_DIALOG_DESTROY_WITH_PARENT),
                                                          "取消", GTK_RESPONSE_CANCEL, "确定", GTK_RESPONSE_OK, nullptr);
         GtkWidget *box = gtk_dialog_get_content_area(GTK_DIALOG(dialog));
-        const std::string label = "行号 (1-" + std::to_string(lineCount) + ")";
+        const std::string label = title + " (1-" + std::to_string(lineCount) + ")";
         GtkWidget *entry = gtk_entry_new();
         gtk_entry_set_text(GTK_ENTRY(entry), std::to_string(currentLine).c_str());
         gtk_container_add(GTK_CONTAINER(box), gtk_label_new(label.c_str()));
@@ -213,7 +234,17 @@ public:
         return line;
     }
 
-    std::string monoFont() const override { return "monospace"; }
+    void setFullScreen(bool enabled) override { if (enabled) gtk_window_fullscreen(GTK_WINDOW(window)); else gtk_window_unfullscreen(GTK_WINDOW(window)); }
+    void setAlwaysOnTop(bool enabled) override { gtk_window_set_keep_above(GTK_WINDOW(window), enabled); }
+    std::string stateDirectory() const override { return (std::filesystem::path(g_get_user_config_dir()) / "NotepadSharp").string(); }
+    bool askReloadExternal(const std::string &message) override {
+        GtkWidget *dialog = gtk_message_dialog_new(GTK_WINDOW(window), GTK_DIALOG_MODAL, GTK_MESSAGE_QUESTION, GTK_BUTTONS_YES_NO, "%s", message.c_str());
+        gtk_dialog_set_default_response(GTK_DIALOG(dialog), GTK_RESPONSE_NO);
+        const bool yes = gtk_dialog_run(GTK_DIALOG(dialog)) == GTK_RESPONSE_YES;
+        gtk_widget_destroy(dialog); return yes;
+    }
+    bool askOverwriteExternal(const std::string &message) override { return askReloadExternal(message); }
+    std::string monoFont() const override { return "JetBrains Mono"; }
     int defaultEol() const override { return SC_EOL_LF; }
 
     void quit() override {
@@ -282,24 +313,68 @@ GtkWidget *menuBar(GtkAccelGroup *accels, GtkHost *host) {
     addItem(view, "放大(_I)", CmdZoomIn, accels, GDK_KEY_equal, GDK_CONTROL_MASK);
     addItem(view, "缩小(_O)", CmdZoomOut, accels, GDK_KEY_minus, GDK_CONTROL_MASK);
     addItem(view, "重置缩放(_R)", CmdZoomReset, accels, GDK_KEY_0, GDK_CONTROL_MASK);
+    GtkWidget *tools = section("代码工具");
+    std::vector<GtkWidget *> commandMenus{file, edit, search, view};
+    for (const char *group : {"会话与文件", "编码", "搜索结果", "文本处理", "书签与折叠", "宏", "代码补全", "视图"}) {
+        GtkWidget *item = gtk_menu_item_new_with_label(group);
+        GtkWidget *submenu = gtk_menu_new(); gtk_menu_item_set_submenu(GTK_MENU_ITEM(item), submenu);
+        gtk_menu_shell_append(GTK_MENU_SHELL(tools), item); commandMenus.push_back(submenu);
+        for (const auto &entry : extraCommands) if (std::strcmp(extraCommandGroup(entry.command), group) == 0) {
+            const guint key = entry.command == CmdCompleteWord ? GDK_KEY_space : entry.command == CmdNextResult || entry.command == CmdPrevResult ? GDK_KEY_F4 : 0;
+            const auto mods = entry.command == CmdCompleteWord ? GDK_CONTROL_MASK : entry.command == CmdPrevResult ? GDK_SHIFT_MASK : static_cast<GdkModifierType>(0);
+            addItem(submenu, entry.label, entry.command, accels, key, mods);
+        }
+    }
+    GtkWidget *font = section("字体");
+    for (int size = 6; size <= 72; ++size) addItem(font, (std::to_string(size) + " pt").c_str(), static_cast<Command>(CmdFontSizeBase + size), accels, 0, static_cast<GdkModifierType>(0));
+    for (int i = 0; i < 8; ++i) addItem(font, ("Weight " + std::to_string(100 * (i+1))).c_str(), static_cast<Command>(CmdFontWeightBase + i), accels, 0, static_cast<GdkModifierType>(0));
+    addItem(font, "切换斜体", CmdFontItalic, accels, 0, static_cast<GdkModifierType>(0));
     g_signal_connect(bar, "button-press-event", G_CALLBACK(+[](GtkWidget *, GdkEvent *, gpointer) { return FALSE; }), nullptr);
     auto activate = +[](GtkWidget *item, GtkHost *self) {
         const Command command = static_cast<Command>(GPOINTER_TO_INT(g_object_get_data(G_OBJECT(item), "cmd")));
         if (self->app && command) self->app->onCommand(command);
     };
-    for (GtkWidget *menu : {file, edit, search, view}) {
+    GtkWidget *languages = section("语言");
+    for (int i=0; i<languageChoiceCount; ++i) addItem(languages, languageChoices[i].label, static_cast<Command>(CmdLanguageBase+i), accels, 0, static_cast<GdkModifierType>(0));
+    commandMenus.push_back(languages);
+    commandMenus.push_back(font);
+    for (GtkWidget *menu : commandMenus) {
         GList *children = gtk_container_get_children(GTK_CONTAINER(menu));
         for (GList *node = children; node; node = node->next) {
             g_signal_connect(node->data, "activate", G_CALLBACK(activate), host);
         }
         g_list_free(children);
     }
+    auto dynamicMenu = [&](GtkWidget *parent, const char *title, bool recent) {
+        GtkWidget *item = gtk_menu_item_new_with_label(title), *menu = gtk_menu_new();
+        gtk_menu_item_set_submenu(GTK_MENU_ITEM(item), menu); gtk_menu_shell_append(GTK_MENU_SHELL(parent), item);
+        g_object_set_data(G_OBJECT(menu), "recent", GINT_TO_POINTER(recent));
+        g_signal_connect(menu, "show", G_CALLBACK(+[](GtkWidget *menu, GtkHost *self) {
+            GList *old = gtk_container_get_children(GTK_CONTAINER(menu));
+            for (GList *node=old; node; node=node->next) gtk_widget_destroy(GTK_WIDGET(node->data)); g_list_free(old);
+            const bool recent = GPOINTER_TO_INT(g_object_get_data(G_OBJECT(menu), "recent"));
+            const auto names = recent ? self->app->recentFiles() : self->app->documentNames();
+            for (size_t i=0; i<names.size() && i<1000; ++i) {
+                GtkWidget *entry = gtk_menu_item_new_with_label(names[i].c_str());
+                g_object_set_data(G_OBJECT(entry), "cmd", GINT_TO_POINTER((recent ? CmdRecentBase : CmdDocumentBase)+static_cast<int>(i)));
+                g_signal_connect(entry, "activate", G_CALLBACK(+[](GtkWidget *entry, GtkHost *self) { self->app->onCommand(static_cast<Command>(GPOINTER_TO_INT(g_object_get_data(G_OBJECT(entry), "cmd")))); }), self);
+                gtk_menu_shell_append(GTK_MENU_SHELL(menu), entry); gtk_widget_show(entry);
+            }
+        }), host);
+    };
+    dynamicMenu(file, "最近文件", true); dynamicMenu(bar, "窗口", false);
     return bar;
 }
 
 }  // namespace
 
 int main(int argc, char **argv) {
+    const auto fonts = std::filesystem::read_symlink("/proc/self/exe").parent_path() / "fonts";
+    if (std::filesystem::exists(fonts)) {
+        for (const auto &entry : std::filesystem::directory_iterator(fonts))
+            if (entry.path().extension() == ".ttf") FcConfigAppFontAddFile(FcConfigGetCurrent(), reinterpret_cast<const FcChar8 *>(entry.path().c_str()));
+        FcConfigBuildFonts(FcConfigGetCurrent());
+    }
     gtk_init(&argc, &argv);
     GtkHost host;
     host.window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
@@ -327,8 +402,12 @@ int main(int argc, char **argv) {
     }), &host);
     g_signal_connect(host.window, "destroy", G_CALLBACK(gtk_main_quit), nullptr);
     app.start();
+    const guint fileTimer = g_timeout_add_seconds(2, +[](gpointer data) -> gboolean { static_cast<App *>(data)->pollFiles(); return G_SOURCE_CONTINUE; }, &app);
+    const guint recoveryTimer = g_timeout_add_seconds(30, +[](gpointer data) -> gboolean { static_cast<App *>(data)->checkpoint(); return G_SOURCE_CONTINUE; }, &app);
     if (argc > 1) app.openPath(argv[1]);
     gtk_widget_show_all(host.window);
     gtk_main();
+    g_source_remove(recoveryTimer);
+    g_source_remove(fileTimer);
     return 0;
 }
