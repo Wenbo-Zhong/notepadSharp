@@ -29,10 +29,14 @@ struct Slot {
 
 class MacHost;
 
-@interface AppDelegate : NSObject <NSApplicationDelegate, NSTabViewDelegate, NSMenuDelegate>
+@interface AppDelegate : NSObject <NSApplicationDelegate, NSTabViewDelegate, NSMenuDelegate, NSWindowDelegate>
 @property(nonatomic, assign) MacHost *host;
 - (NSInteger)lastDialogTag;
 - (void)endDialog:(id)sender;
+- (void)performSearchAction:(id)sender;
+- (void)doCommand:(id)sender;
+- (void)showTabMenu:(NSEvent *)event;
+- (void)toolbarCommand:(id)sender;
 @end
 
 
@@ -46,6 +50,15 @@ public:
     App *app = nullptr;
     int nextId = 1;
     std::vector<Slot> slots;
+    bool closeApproved = false;
+    NSStackView *toolbar = nil;
+    NSPanel *searchPanel = nil;
+    NSPopUpButton *searchMode = nil, *searchSyntax = nil;
+    NSTextField *findField = nil, *replaceField = nil, *searchStatus = nil;
+    NSButton *matchCase = nil, *wholeWord = nil, *wrap = nil, *backwards = nil;
+    NSButton *selection = nil, *dot = nil, *unicode = nil;
+    FindRequest searchRequest{};
+    std::function<void(const FindRequest &)> performSearch;
 
     Slot *slot(int id) {
         for (Slot &item : slots) {
@@ -56,7 +69,7 @@ public:
 
     NSTabViewItem *itemFor(int id) {
         for (NSTabViewItem *item in tabs.tabViewItems) {
-            if (static_cast<int>(reinterpret_cast<intptr_t>(item.identifier)) == id) return item;
+            if ([item.identifier isKindOfClass:NSNumber.class] && [item.identifier intValue] == id) return item;
         }
         return nil;
     }
@@ -79,7 +92,7 @@ public:
             }
         };
         [item.editor registerNotifyCallback:docId value:notify];
-        NSTabViewItem *tab = [[NSTabViewItem alloc] initWithIdentifier:reinterpret_cast<id>(static_cast<intptr_t>(item.id))];
+        NSTabViewItem *tab = [[NSTabViewItem alloc] initWithIdentifier:@(item.id)];
         tab.label = @"未命名";
         tab.view = item.editor;
         [tabs addTabViewItem:tab];
@@ -116,6 +129,97 @@ public:
         if (NSTabViewItem *item = itemFor(doc)) {
             item.label = toNS(title);
         }
+    }
+
+    bool showFindDialog(const FindRequest &seed, bool replaceMode,
+                        const std::function<void(const FindRequest &)> &perform) override {
+        performSearch = perform;
+        if (!searchPanel) {
+            searchPanel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, 570, 340)
+                styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable
+                backing:NSBackingStoreBuffered defer:NO];
+            searchPanel.title = @"查找与替换";
+            searchPanel.hidesOnDeactivate = NO;
+            searchPanel.level = NSFloatingWindowLevel;
+            NSView *content = searchPanel.contentView;
+            searchMode = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(16, 300, 180, 26) pullsDown:NO];
+            [searchMode addItemsWithTitles:@[@"查找", @"替换", @"标记"]];
+            [content addSubview:searchMode];
+            NSTextField *findLabel = [NSTextField labelWithString:@"查找目标："];
+            findLabel.frame = NSMakeRect(16, 263, 76, 22); [content addSubview:findLabel];
+            findField = [[NSTextField alloc] initWithFrame:NSMakeRect(96, 262, 458, 24)]; [content addSubview:findField];
+            NSTextField *replaceLabel = [NSTextField labelWithString:@"替换为："];
+            replaceLabel.frame = NSMakeRect(16, 229, 76, 22); [content addSubview:replaceLabel];
+            replaceField = [[NSTextField alloc] initWithFrame:NSMakeRect(96, 228, 458, 24)]; [content addSubview:replaceField];
+            auto box = [&](NSString *title, CGFloat x, CGFloat y, CGFloat width) {
+                NSButton *button = [NSButton checkboxWithTitle:title target:nil action:nil];
+                button.frame = NSMakeRect(x, y, width, 22); [content addSubview:button]; return button;
+            };
+            matchCase = box(@"匹配大小写", 16, 190, 140);
+            wholeWord = box(@"全词匹配", 170, 190, 120);
+            wrap = box(@"循环查找", 310, 190, 120);
+            backwards = box(@"反向查找", 16, 160, 140);
+            selection = box(@"选区范围", 170, 160, 120);
+            dot = box(@". 匹配换行", 310, 160, 130);
+            searchSyntax = [[NSPopUpButton alloc] initWithFrame:NSMakeRect(16, 120, 190, 26) pullsDown:NO];
+            [searchSyntax addItemsWithTitles:@[@"普通", @"扩展", @"正则"]];
+            searchSyntax.target = delegate; searchSyntax.action = @selector(doCommand:); searchSyntax.tag = 990;
+            [content addSubview:searchSyntax];
+            unicode = box(@"完整 Unicode（ICU 属性、折叠、字素簇）", 220, 120, 330);
+            searchStatus = [NSTextField labelWithString:@"正则替换支持 \\1、$1、$+{name}。"];
+            searchStatus.frame = NSMakeRect(16, 88, 538, 20); [content addSubview:searchStatus];
+            const struct { NSString *title; NSInteger tag; CGFloat x; CGFloat y; } actions[] = {
+                {@"查找下一个", 1, 16, 48}, {@"查找上一个", 2, 112, 48}, {@"计数", 3, 208, 48},
+                {@"查找当前文档", 4, 304, 48}, {@"查找所有文档", 5, 424, 48},
+                {@"替换", 6, 16, 12}, {@"全部替换", 7, 112, 12},
+                {@"替换打开文档", 8, 208, 12}, {@"标记全部", 9, 328, 12}, {@"清除标记", 10, 424, 12}};
+            for (const auto &entry : actions) {
+                NSButton *button = [NSButton buttonWithTitle:entry.title target:delegate action:@selector(performSearchAction:)];
+                button.tag = entry.tag; button.frame = NSMakeRect(entry.x, entry.y, 116, 28); [content addSubview:button];
+            }
+            [searchPanel center];
+        }
+        if (!searchPanel.isVisible || seed.find != searchRequest.find) {
+            searchRequest = seed;
+            findField.stringValue = toNS(seed.find); replaceField.stringValue = toNS(seed.replace);
+            matchCase.state = seed.matchCase ? NSControlStateValueOn : NSControlStateValueOff;
+            wholeWord.state = seed.wholeWord ? NSControlStateValueOn : NSControlStateValueOff;
+            wrap.state = seed.wrapAround ? NSControlStateValueOn : NSControlStateValueOff;
+            backwards.state = seed.backwards ? NSControlStateValueOn : NSControlStateValueOff;
+            selection.state = seed.inSelection ? NSControlStateValueOn : NSControlStateValueOff;
+            dot.state = seed.dotMatchesNewline ? NSControlStateValueOn : NSControlStateValueOff;
+            unicode.state = seed.unicode ? NSControlStateValueOn : NSControlStateValueOff;
+            [searchSyntax selectItemAtIndex:seed.regex ? 2 : seed.extended ? 1 : 0];
+        }
+        [searchMode selectItemAtIndex:replaceMode ? 1 : 0];
+        [NSApp activateIgnoringOtherApps:YES]; [searchPanel makeKeyAndOrderFront:nil];
+        [searchPanel makeFirstResponder:findField];
+        return true;
+    }
+
+    void performFindAction(NSInteger tag) {
+        searchRequest.find = fromNS(findField.stringValue); searchRequest.replace = fromNS(replaceField.stringValue);
+        searchRequest.matchCase = matchCase.state == NSControlStateValueOn;
+        searchRequest.wholeWord = wholeWord.state == NSControlStateValueOn;
+        searchRequest.wrapAround = wrap.state == NSControlStateValueOn;
+        searchRequest.backwards = backwards.state == NSControlStateValueOn;
+        searchRequest.inSelection = selection.state == NSControlStateValueOn;
+        searchRequest.dotMatchesNewline = dot.state == NSControlStateValueOn;
+        searchRequest.unicode = unicode.state == NSControlStateValueOn;
+        searchRequest.cancelled = searchRequest.find.empty();
+        const FindAction actions[] = {FindAction::Next, FindAction::Previous, FindAction::Count,
+            FindAction::FindAllCurrent, FindAction::FindAllOpen, FindAction::ReplaceOne,
+            FindAction::ReplaceAll, FindAction::ReplaceAllOpen, FindAction::MarkAll, FindAction::ClearMarks};
+        if (tag >= 1 && tag <= 10) {
+            searchRequest.action = actions[tag - 1];
+            if (performSearch && !searchRequest.cancelled) performSearch(searchRequest);
+        }
+    }
+
+    void selectSearchSyntax() {
+        const NSInteger mode = searchSyntax.indexOfSelectedItem;
+        searchRequest.regex = mode == 2; searchRequest.extended = mode == 1;
+        dot.enabled = searchRequest.regex; unicode.enabled = searchRequest.regex;
     }
 
     std::string choosePath(bool save, const std::string &suggested) {
@@ -286,8 +390,36 @@ public:
     [NSApp stopModal];
 }
 
-- (void)doCommand:(id)sender {
+- (void)performSearchAction:(id)sender {
+    if (_hostObject) _hostObject->performFindAction([sender tag]);
+}
+
+- (void)toolbarCommand:(id)sender {
     if (_app) _app->onCommand(static_cast<Command>([sender tag]));
+}
+
+- (void)doCommand:(id)sender {
+    if ([sender tag] == 990) { if (_hostObject) _hostObject->selectSearchSyntax(); return; }
+    if (_app) _app->onCommand(static_cast<Command>([sender tag]));
+}
+
+- (void)showTabMenu:(NSEvent *)event {
+    if (!_hostObject || !_app) return;
+    NSView *view = event.window.contentView;
+    NSPoint point = [view convertPoint:event.locationInWindow fromView:nil];
+    NSTabViewItem *tab = [_hostObject->tabs tabViewItemAtPoint:[_hostObject->tabs convertPoint:point fromView:view]];
+    if (tab && [tab.identifier isKindOfClass:NSNumber.class]) _app->onTabChanged([tab.identifier intValue]);
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"文档"];
+    const struct { NSString *title; Command command; } entries[] = {
+        {@"保存", CmdSave}, {@"另存为...", CmdSaveAs}, {@"拷贝另存为...", CmdSaveCopy},
+        {@"重新读取文件", CmdReload}, {@"编辑器只读", CmdReadOnly}, {@"关闭", CmdClose},
+        {@"关闭其他文档", CmdCloseOthers}, {@"关闭左侧文档", CmdCloseLeft}, {@"关闭右侧文档", CmdCloseRight},
+        {@"复制完整文件路径", CmdCopyFullPath}, {@"复制文件名", CmdCopyFileName}, {@"复制所在目录路径", CmdCopyDirectory}};
+    for (size_t i = 0; i < sizeof(entries) / sizeof(entries[0]); ++i) {
+        if (i == 5 || i == 9) [menu addItem:NSMenuItem.separatorItem];
+        [menu addItem:[self item:entries[i].title command:entries[i].command key:@"" mods:0]];
+    }
+    [NSMenu popUpContextMenu:menu withEvent:event forView:view];
 }
 
 - (NSMenuItem *)item:(NSString *)title command:(Command)command key:(NSString *)key mods:(NSEventModifierFlags)mods {
@@ -307,16 +439,53 @@ public:
                                                        styleMask:NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable
                                                          backing:NSBackingStoreBuffered
                                                            defer:NO];
-    _hostObject->tabs = [[NSTabView alloc] initWithFrame:NSMakeRect(0, 24, 960, 616)];
-    _hostObject->tabs.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    _hostObject->window.delegate = self;
+    NSView *content = _hostObject->window.contentView;
+    _hostObject->toolbar = [[NSStackView alloc] initWithFrame:NSZeroRect];
+    _hostObject->toolbar.orientation = NSUserInterfaceLayoutOrientationHorizontal;
+    _hostObject->toolbar.alignment = NSLayoutAttributeCenterY;
+    _hostObject->toolbar.distribution = NSStackViewDistributionFill;
+    _hostObject->toolbar.spacing = 6;
+    _hostObject->toolbar.edgeInsets = NSEdgeInsetsMake(4, 8, 4, 8);
+    const struct { NSString *title; Command command; } toolbarItems[] = {
+        {@"新建", CmdNew}, {@"打开", CmdOpen}, {@"保存", CmdSave}, {@"全部保存", CmdSaveAll},
+        {@"撤销", CmdUndo}, {@"重做", CmdRedo}, {@"查找", CmdFind}, {@"替换", CmdReplace},
+        {@"文件夹搜索", CmdFindInFolder}, {@"只读", CmdReadOnly}};
+    for (const auto &entry : toolbarItems) {
+        NSButton *button = [NSButton buttonWithTitle:entry.title target:self action:@selector(toolbarCommand:)];
+        button.tag = entry.command;
+        button.bezelStyle = NSBezelStyleToolbar;
+        [button setContentHuggingPriority:NSLayoutPriorityRequired forOrientation:NSLayoutConstraintOrientationHorizontal];
+        [_hostObject->toolbar addArrangedSubview:button];
+    }
+    _hostObject->toolbar.translatesAutoresizingMaskIntoConstraints = NO;
+    [content addSubview:_hostObject->toolbar];
+    _hostObject->tabs = [[NSTabView alloc] initWithFrame:NSZeroRect];
+    _hostObject->tabs.translatesAutoresizingMaskIntoConstraints = NO;
     _hostObject->tabs.delegate = self;
-    _hostObject->status = [[NSTextField alloc] initWithFrame:NSMakeRect(8, 2, 940, 20)];
+    NSClickGestureRecognizer *rightClick = [[NSClickGestureRecognizer alloc] initWithTarget:self action:@selector(showTabMenu:)];
+    rightClick.buttonMask = 0x2;
+    [_hostObject->tabs addGestureRecognizer:rightClick];
+    _hostObject->status = [[NSTextField alloc] initWithFrame:NSZeroRect];
+    _hostObject->status.translatesAutoresizingMaskIntoConstraints = NO;
     _hostObject->status.editable = NO;
     _hostObject->status.bezeled = NO;
     _hostObject->status.drawsBackground = NO;
-    _hostObject->status.autoresizingMask = NSViewWidthSizable;
-    [_hostObject->window.contentView addSubview:_hostObject->tabs];
-    [_hostObject->window.contentView addSubview:_hostObject->status];
+    [content addSubview:_hostObject->tabs];
+    [content addSubview:_hostObject->status];
+    [NSLayoutConstraint activateConstraints:@[
+        [_hostObject->toolbar.topAnchor constraintEqualToAnchor:content.topAnchor],
+        [_hostObject->toolbar.leadingAnchor constraintEqualToAnchor:content.leadingAnchor],
+        [_hostObject->toolbar.trailingAnchor constraintEqualToAnchor:content.trailingAnchor],
+        [_hostObject->toolbar.heightAnchor constraintEqualToConstant:42],
+        [_hostObject->tabs.topAnchor constraintEqualToAnchor:_hostObject->toolbar.bottomAnchor],
+        [_hostObject->tabs.leadingAnchor constraintEqualToAnchor:content.leadingAnchor],
+        [_hostObject->tabs.trailingAnchor constraintEqualToAnchor:content.trailingAnchor],
+        [_hostObject->tabs.bottomAnchor constraintEqualToAnchor:_hostObject->status.topAnchor],
+        [_hostObject->status.leadingAnchor constraintEqualToAnchor:content.leadingAnchor constant:8],
+        [_hostObject->status.trailingAnchor constraintEqualToAnchor:content.trailingAnchor constant:-8],
+        [_hostObject->status.bottomAnchor constraintEqualToAnchor:content.bottomAnchor constant:-2],
+        [_hostObject->status.heightAnchor constraintEqualToConstant:20]]];
 
     NSMenu *menubar = [[NSMenu alloc] init];
     auto top = [&](NSString *title, NSMenu *menu) {
@@ -397,20 +566,35 @@ public:
 - (void)menuNeedsUpdate:(NSMenu *)menu {
     if (!_app) return;
     const bool recent = [menu.title isEqualToString:@"最近文件"];
+    const bool documents = [menu.title isEqualToString:@"窗口"];
     const auto names = recent ? _app->recentFiles() : _app->documentNames();
     [menu removeAllItems];
-    for (size_t i=0; i<names.size() && i<1000; ++i) [menu addItem:[self item:toNS(names[i]) command:static_cast<Command>((recent ? CmdRecentBase : CmdDocumentBase)+i) key:@"" mods:0]];
+    for (size_t i=0; i<names.size() && i<1000; ++i)
+        [menu addItem:[self item:toNS(names[i]) command:static_cast<Command>((recent ? CmdRecentBase : CmdDocumentBase)+i) key:@"" mods:0]];
+    (void)documents;
 }
 
 - (NSApplicationTerminateReply)applicationShouldTerminate:(NSApplication *)sender {
     (void)sender;
+    if (_hostObject && _hostObject->closeApproved) return NSTerminateNow;
     if (_app && !_app->onCloseRequested()) return NSTerminateCancel;
     return NSTerminateNow;
 }
 
+- (BOOL)windowShouldClose:(NSWindow *)sender {
+    if (sender != _hostObject->window || !_app) return YES;
+    if (!_app->onCloseRequested()) return NO;
+    _hostObject->closeApproved = true;
+    return YES;
+}
+
+- (void)windowWillClose:(NSNotification *)notification {
+    if (notification.object == _hostObject->window) [NSApp terminate:nil];
+}
+
 - (void)tabView:(NSTabView *)tabView didSelectTabViewItem:(NSTabViewItem *)tabViewItem {
     (void)tabView;
-    if (_app) _app->onTabChanged(static_cast<int>(reinterpret_cast<intptr_t>(tabViewItem.identifier)));
+    if (_app && [tabViewItem.identifier isKindOfClass:NSNumber.class]) _app->onTabChanged([tabViewItem.identifier intValue]);
 }
 
 - (BOOL)applicationSupportsSecureRestorableState:(NSApplication *)app {
@@ -423,8 +607,7 @@ int main(int argc, const char **argv) {
     (void)argc;
     (void)argv;
     @autoreleasepool {
-        NSString *directory = [[NSProcessInfo.processInfo.arguments[0] stringByStandardizingPath] stringByDeletingLastPathComponent];
-        NSURL *fonts = [NSURL fileURLWithPath:[directory stringByAppendingPathComponent:@"fonts"]];
+        NSURL *fonts = [[NSBundle mainBundle].resourceURL URLByAppendingPathComponent:@"fonts"];
         for (NSURL *url in [[NSFileManager defaultManager] contentsOfDirectoryAtURL:fonts includingPropertiesForKeys:nil options:0 error:nil]) {
             if ([url.pathExtension isEqualToString:@"ttf"]) CTFontManagerRegisterFontsForURL((__bridge CFURLRef)url, kCTFontManagerScopeProcess, nullptr);
         }

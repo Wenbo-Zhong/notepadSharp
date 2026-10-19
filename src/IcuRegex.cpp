@@ -7,6 +7,7 @@
 #include <windows.h>
 #elif defined(__APPLE__)
 #include <mach-o/dyld.h>
+#include <CoreFoundation/CoreFoundation.h>
 #else
 #include <unistd.h>
 #endif
@@ -54,7 +55,16 @@ void initializeData() {
         if (length < 0 || length == static_cast<ssize_t>(path.size())) throw std::runtime_error("Cannot locate ICU data");
         executable = std::string(path.data(), length);
 #endif
-        std::ifstream stream(executable.parent_path() / "unicode" / "icudt78l.dat", std::ios::binary);
+        std::filesystem::path dataDirectory = executable.parent_path();
+#ifdef __APPLE__
+        if (CFURLRef resources = CFBundleCopyResourcesDirectoryURL(CFBundleGetMainBundle())) {
+            UInt8 resourcePath[PATH_MAX]{};
+            if (CFURLGetFileSystemRepresentation(resources, true, resourcePath, sizeof(resourcePath)))
+                dataDirectory = reinterpret_cast<const char *>(resourcePath);
+            CFRelease(resources);
+        }
+#endif
+        std::ifstream stream(dataDirectory / "unicode" / "icudt78l.dat", std::ios::binary);
         std::string bytes((std::istreambuf_iterator<char>(stream)), {});
         size = bytes.size(); data = bytes.data();
 #endif
